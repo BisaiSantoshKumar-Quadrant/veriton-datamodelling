@@ -461,6 +461,8 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
             # Build FK list
             if attr.get("is_foreign_key", False):
                 raw_ref = attr.get("references", "") or ""
+                if not raw_ref:  # skip FK with no reference
+                    continue
                 if "." in raw_ref:
                     ref_table, ref_col = raw_ref.split(".", 1)
                 else:
@@ -468,7 +470,7 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
 
                 foreign_keys.append({
                     "column":            attr_name,
-                    "references_table":  ref_table,
+                    "references_table":  ref_table.strip().lower(),
                     "references_column": ref_col
                 })
 

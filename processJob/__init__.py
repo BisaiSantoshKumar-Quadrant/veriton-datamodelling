@@ -382,11 +382,13 @@ def _run_er_modeling_and_save(
     all_dim_tables       = []
 
     source_names = {s.get("table_name", "") for s in schemas}
+    for t in relationship_info.get("tables", []):
+        logging.info(f"DEBUG table entry: {t.get('table')} | type: {type(t.get('table'))}")
     normalized_tables = [
         t for t in relationship_info.get("tables", [])
-        if t.get("table").lower() not in source_names
-        and t.get("table").lower() != "fact_table"
-        and t.get("table")  # not empty
+        if isinstance(t.get("table"), str)
+        and t.get("table", "").lower() != "fact_table"
+        and t.get("table")
     ]
     # Identify candidate fact table:
     # Entity with the most outgoing FKs = transactional grain
@@ -441,9 +443,18 @@ def _run_er_modeling_and_save(
                     "is_primary_key":         False,
                     "sample_values":          []
                 })
+                
+                ref_table = fk.get("references_table")
+
+                if isinstance(ref_table, dict):
+                    ref_table = ref_table.get("table") or ref_table.get("name") or ""
+
+                if not ref_table:  # skip if still empty
+                    continue
+
                 virtual_fact_fks.append({
-                    "column":            col_name,
-                    "references_table":  fk.get("references_table").lower(),
+                    "column": col_name,
+                    "references_table": ref_table.lower() if ref_table else "",
                     "references_column": fk.get("references_column")
                 })
         # 3. Add numeric measure columns from the fact entity
@@ -515,12 +526,32 @@ def _run_er_modeling_and_save(
         columns    = schema.get("columns", [])
         row_count  = schema.get("row_count", 0)
 
-        table_info   = next(
-            (t for t in relationship_info.get("tables", []) if t.get("table") == table_name),
+        table_info = next(
+            (t for t in relationship_info.get("tables", [])
+            if t.get("table", "").lower() == table_name.lower()),
             None
         )
-        primary_keys = table_info.get("primary_keys", []) if table_info else []
-        surrogate_keys = table_info.get("surrogate_keys", []) if table_info else []
+        if not table_info or not table_info.get("primary_keys"):
+            raw = relationship_info.get("raw_entity_analysis", {}).get(table_name, {})
+            primary_keys = [
+                c["name"] for c in raw.get("columns", [])
+                if "pk" in c.get("observations", "").lower()
+                or "suitable as pk" in c.get("observations", "").lower()
+                or "unique identifier" in c.get("observations", "").lower()
+            ]
+            # ── Issue 4 fix: final fallback — read is_primary_key / is_potential_key
+            # directly from the schema columns when neither table_info nor raw analysis
+            # could identify PKs.
+            if not primary_keys:
+                primary_keys = [
+                    col.get("column_name", "")
+                    for col in columns
+                    if col.get("is_primary_key") or col.get("is_potential_key")
+                ]
+            surrogate_keys = []
+        else:
+            primary_keys = table_info.get("primary_keys", [])
+            surrogate_keys = table_info.get("surrogate_keys", [])
 
         avg_null_pct = (
             round(sum(col.get("null_percentage", 0) for col in columns) / len(columns), 1)
@@ -567,6 +598,16 @@ def _run_er_modeling_and_save(
     enriched_tables.append({
         "table_name":     "fact_table",
         "table_type":     "FACT",
+        # ── Issue 5 fix: ensure derived_from is always a resolvable source table name
+                "derived_from": (
+                    fact_entity.get("derived_from")
+                    or next(
+                        (s.get("table_name", "") for s in schemas
+                        if s.get("table_name", "").lower().replace("_", "")
+                            == (fact_entity_name or "").replace("_", "")),
+                        fact_entity_name or ""
+                    )
+                ) if fact_entity else "",
         "row_count": fact_row_count,
         "column_count": len(virtual_fact_columns),
         "null_percentage": 0.0,
@@ -633,6 +674,9 @@ def _run_er_modeling_and_save(
     # Relationships
     enriched_relationships = []
     for fk in virtual_fact_fks:
+        to_table = fk.get("references_table", "")
+        if not to_table:  # skip malformed FKs
+            continue
         enriched_relationships.append({
             "from_table":        "fact_table",
             "from_column":       fk.get("column", ""),
@@ -655,13 +699,12 @@ def _run_er_modeling_and_save(
         if rel.get("from_table") != "fact_table":
             enriched_relationships.append(rel)
     normalized_table_names = [
-            t["table_name"] for t in enriched_tables
-            if t.get("is_normalized") and t["table_name"] != "fact_table"
-        ]
-    physical_table_names = [
-            t["table_name"] for t in enriched_tables
-            if not t.get("is_source_only") and t["table_name"] != "fact_table"
-        ]
+        t["table_name"] for t in enriched_tables
+        if t.get("is_normalized") and t["table_name"] != "fact_table"
+    ]
+    # ── Issue 3 fix: physical source table names come from the original schema objects,
+    # NOT from enriched_tables (whose names may already be entity-mapped).
+    physical_table_names = [s.get("table_name", "").lower() for s in schemas]
 
     complete_analysis = {
         "analysis_timestamp": datetime.utcnow().isoformat(),
@@ -717,6 +760,7 @@ def _run_er_modeling_and_save(
         table["table_name"] = lower
 
     # 2️⃣ Normalize relationship references
+    # 2️⃣ Normalize relationship references
     for rel in enriched_relationships:
         rel["from_table"] = normalized_name_map.get(
             rel.get("from_table"),
@@ -726,6 +770,22 @@ def _run_er_modeling_and_save(
             rel.get("to_table"),
             rel.get("to_table", "").lower()
         )
+
+    # 2b️⃣ Normalize FK references_table inside each table's foreign_keys array
+    # This catches PascalCase leaking in from AI output (e.g. "Order", "Product").
+    for table in enriched_tables:
+        for fk in table.get("foreign_keys", []):
+            if "references_table" in fk and fk["references_table"]:
+                fk["references_table"] = normalized_name_map.get(
+                    fk["references_table"],
+                    fk["references_table"].lower()
+                )
+        for col in table.get("columns", []):
+            if "references_table" in col and col.get("references_table"):
+                col["references_table"] = normalized_name_map.get(
+                    col["references_table"],
+                    col["references_table"].lower()
+                )
 
     # 3️⃣ Normalize summary metadata (CRITICAL FIX)
     complete_analysis["model"]["dimension_tables"] = [
@@ -753,6 +813,8 @@ def _run_er_modeling_and_save(
     logging.info("=" * 80)
     logging.info("🔍 STEP 5: VALIDATING ER MODEL")
     logging.info("=" * 80)
+    for rel in enriched_relationships:
+        logging.info(f"DEBUG rel: from={rel.get('from_table')} to={rel.get('to_table')} col={rel.get('from_column')}")
 
     validation_errors = validate_er_model(complete_analysis)
     critical_errors   = [e for e in validation_errors if e.startswith("CRITICAL")]
