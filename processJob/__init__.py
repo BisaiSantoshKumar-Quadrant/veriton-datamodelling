@@ -54,6 +54,13 @@ except Exception as e:
 SUPPORTED_EXTENSIONS = [".csv", ".parquet", ".json"]
 
 
+def _normalize_name(name: str) -> str:
+    """Normalize names for comparison only. Never use output for display."""
+    if not name:
+        return ""
+    return name.lower().strip().replace(" ", "_").replace("-", "_")
+
+
 # ====================================================================
 # MAIN ENTRY POINT
 # ====================================================================
@@ -176,6 +183,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         for f in processable_files:
             logging.info(f"   📄 {f['name']} ({f['extension']}, {f['size']} bytes)")
 
+        source_dfs = {}
+
         # ============================================================
         # STEP 2: EXTRACT SCHEMAS
         # ============================================================
@@ -217,6 +226,9 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                     df = pd.read_parquet(io.BytesIO(file_data))
                     if df is not None and not df.empty:
                         metadata = extract_schema_metadata(df, filename, blob_path)
+                        
+                        base_name = os.path.splitext(filename)[0].lower().strip().replace(" ", "_").replace("-", "_")
+                        source_dfs[base_name] = df
 
                 if metadata:
                     metadata["user_id"]         = user_id
@@ -271,7 +283,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             schemas, container_client, job_folder,
             job_data, job_status_blob,
             user_id, job_id, processed_count, failed_files,
-            rel_client, norm_client
+            rel_client, norm_client, source_dfs={}
         )
 
     except Exception as e:
@@ -330,7 +342,8 @@ def _handle_ai_only_retry(
         job_data, job_status_blob,
         user_id, job_id,
         processed_count=len(schemas), failed_files=[],
-        rel_client=rel_client, norm_client=norm_client
+        rel_client=rel_client, norm_client=norm_client,
+        source_dfs={}   # no dataframes in retry path — referential check skipped
     )
 
 
@@ -342,12 +355,14 @@ def _run_er_modeling_and_save(
     job_data, job_status_blob,
     user_id, job_id,
     processed_count, failed_files,
-    rel_client, norm_client
+    rel_client, norm_client,
+    source_dfs=None
 ):
     """
     Steps 3–5: ER modeling, virtual fact table, validation, save.
     Shared between normal flow and AI-only retry.
     """
+    source_dfs = source_dfs or {}
 
     # ============================================================
     # STEP 3: DETECT RELATIONSHIPS / BUILD ER MODEL
@@ -359,7 +374,7 @@ def _run_er_modeling_and_save(
     job_data["status"] = "analyzing_relationships"
     job_status_blob.upload_blob(json.dumps(job_data, indent=2), overwrite=True)
 
-    relationship_info = detect_relationships(schemas)
+    relationship_info = detect_relationships(schemas, source_dfs)
 
     model_source       = relationship_info.get("model_source", "ai")
     ai_retry_available = relationship_info.get("ai_retry_available", False)
@@ -398,8 +413,18 @@ def _run_er_modeling_and_save(
     # All entities with outgoing FKs are candidates
     candidates = [t for t in normalized_tables if outgoing_fk_count(t) > 0]
 
-    # Pick the one with most outgoing FKs as fact
-    fact_entity = max(candidates, key=outgoing_fk_count) if candidates else None
+    fact_override = relationship_info.get("fact_entity_override")
+    if fact_override is not None:
+        fact_entity = next(
+            (t for t in normalized_tables
+            if t.get("table", "").lower().strip().replace(" ", "_").replace("-", "_") == fact_override),
+            None
+        )
+        if fact_entity is None:
+            logging.warning(f"fact_entity_override '{fact_override}' not found in normalized_tables, falling back")
+            fact_entity = max(candidates, key=outgoing_fk_count) if candidates else None
+    else:
+        fact_entity = None  # ER-only model, no fact table
 
     fact_entity_name = fact_entity.get("table").lower() if fact_entity else None
     logging.info(f"   🎯 Candidate fact entity: {fact_entity_name}")
@@ -493,10 +518,16 @@ def _run_er_modeling_and_save(
             })
 
     # Dimension tables = all normalized entities EXCEPT the fact entity
-    all_dim_tables = [
-        t.get("table").lower() for t in normalized_tables
-        if t.get("table") != fact_entity_name
-    ]
+    if fact_entity is not None:
+        all_dim_tables = [
+            t.get("table").lower() for t in normalized_tables
+            if t.get("table") != fact_entity_name
+            ]
+    else:
+        all_dim_tables = [
+            t.get("table", "").lower() for t in normalized_tables
+        ]
+        logging.info("   ℹ️  No fact entity found — outputting ER-only model")
 
     # Row count = row count of the source file the fact entity came from
     derived_from = fact_entity.get("derived_from", "") if fact_entity else ""
@@ -557,12 +588,17 @@ def _run_er_modeling_and_save(
             round(sum(col.get("null_percentage", 0) for col in columns) / len(columns), 1)
             if columns else 0
         )
-        
 
+        has_normalized_counterpart = any(
+            _normalize_name(t.get("derived_from", "")) == _normalize_name(table_name)
+            for t in relationship_info.get("tables", [])
+        )
+        
         enriched_tables.append({
             "table_name":     table_name,
             "table_type":    "SOURCE",   # was "DIM"
             "is_source_only": True,      # ADD THIS
+            "has_normalized_counterpart": has_normalized_counterpart,  # ADD THIS
             "is_normalized":  False,
             "row_count":      row_count,
             "column_count":   len(columns),
@@ -595,40 +631,41 @@ def _run_er_modeling_and_save(
         })
 
     # Virtual fact table
-    enriched_tables.append({
-        "table_name":     "fact_table",
-        "table_type":     "FACT",
-        # ── Issue 5 fix: ensure derived_from is always a resolvable source table name
-                "derived_from": (
-                    fact_entity.get("derived_from")
-                    or next(
-                        (s.get("table_name", "") for s in schemas
-                        if s.get("table_name", "").lower().replace("_", "")
-                            == (fact_entity_name or "").replace("_", "")),
-                        fact_entity_name or ""
-                    )
-                ) if fact_entity else "",
-        "row_count": fact_row_count,
-        "column_count": len(virtual_fact_columns),
-        "null_percentage": 0.0,
-        "primary_keys":   fact_entity.get("primary_keys", []) if fact_entity else [],
-        "surrogate_keys": fact_entity.get("surrogate_keys", []) if fact_entity else [],
-        "foreign_keys":   virtual_fact_fks,
-        "columns": [
-            {
-                "name":           col.get("column_name", ""),
-                "data_type":      col.get("data_type", ""),
-                "null_percentage": 0.0,
-                "distinct_count": col.get("distinct_count", 0),
-                "is_primary_key": col.get("is_primary_key", False),
-                "is_surrogate": False,
-                "is_foreign_key": col.get("is_foreign_key", False),
-                "display_label":  col.get("column_name", ""),
-                "tooltip":        "Foreign key in virtual fact table"
-            }
-            for col in virtual_fact_columns
-        ]
-    })
+    if fact_entity is not None:
+        enriched_tables.append({
+            "table_name":     "fact_table",
+            "table_type":     "FACT",
+            # ── Issue 5 fix: ensure derived_from is always a resolvable source table name
+            "derived_from": (
+                fact_entity.get("derived_from")
+                or next(
+                    (s.get("table_name", "") for s in schemas
+                    if s.get("table_name", "").lower().replace("_", "")
+                        == (fact_entity_name or "").replace("_", "")),
+                    fact_entity_name or ""
+                )
+            ) if fact_entity else "",
+            "row_count": fact_row_count,
+            "column_count": len(virtual_fact_columns),
+            "null_percentage": 0.0,
+            "primary_keys":   fact_entity.get("primary_keys", []) if fact_entity else [],
+            "surrogate_keys": fact_entity.get("surrogate_keys", []) if fact_entity else [],
+            "foreign_keys":   virtual_fact_fks,
+            "columns": [
+                {
+                    "name":           col.get("column_name", ""),
+                    "data_type":      col.get("data_type", ""),
+                    "null_percentage": 0.0,
+                    "distinct_count": col.get("distinct_count", 0),
+                    "is_primary_key": col.get("is_primary_key", False),
+                    "is_surrogate": False,
+                    "is_foreign_key": col.get("is_foreign_key", False),
+                    "display_label":  col.get("column_name", ""),
+                    "tooltip":        "Foreign key in virtual fact table"
+                }
+                for col in virtual_fact_columns
+            ]
+        })
     # Add normalized logical entities (AI-decomposed from source tables)
     # These are the real output when model_source == "ai" and decomposition happened
     if model_source == "ai":
@@ -714,8 +751,8 @@ def _run_er_modeling_and_save(
 
         # Model metadata
         "model": {
-            "type":             "STAR_SCHEMA",
-            "fact_table":       "fact_table",
+            "type": "STAR_SCHEMA" if fact_entity else "ER_ONLY",
+            "fact_table": "fact_table" if fact_entity else None,
             "dimension_tables": all_dim_tables
         },
 
@@ -735,8 +772,12 @@ def _run_er_modeling_and_save(
         
 
         "summary": {
-            "total_tables": len([t for t in enriched_tables if not t.get("is_source_only")]),
-            "fact_tables":            ["fact_table"],
+            "total_tables": (
+                len([t for t in enriched_tables if not t.get("is_source_only")])
+                if fact_entity
+                else len(enriched_tables)
+            ),
+            "fact_tables":            ["fact_table"] if fact_entity else [],
             "dimension_tables":       all_dim_tables,
             "normalized_entities":    normalized_table_names,
             "physical_source_tables": physical_table_names,
@@ -754,7 +795,7 @@ def _run_er_modeling_and_save(
     # 1️⃣ Normalize table names
     for table in enriched_tables:
         original = table["table_name"]
-        lower    = original.lower()
+        lower = original.lower().strip().replace(" ", "_").replace("-", "_")
         normalized_name_map[original] = lower
         normalized_name_map[lower] = lower 
         table["table_name"] = lower
@@ -877,6 +918,7 @@ def _run_er_modeling_and_save(
         # Use normalized_entities from the tables list instead
         for table in relationship_info.get("tables", []):
             entity_name = table.get("table")
+            entity_name_normalized = (entity_name or "").lower().strip().replace(" ", "_").replace("-", "_")
             if not entity_name or entity_name == "fact_table":
                 continue
 
@@ -911,7 +953,8 @@ def _run_er_modeling_and_save(
                 ]
             }
 
-            normalized_path = f"{user_id}/{job_id}/schema_{entity_name}.json"
+            normalized_path = f"{user_id}/{job_id}/schema_{entity_name_normalized}.json"
+
             norm_blob = norm_client.get_blob_client(normalized_path)
             norm_blob.upload_blob(
                 json.dumps(normalized_schema, indent=2, cls=NumpyEncoder),

@@ -11,6 +11,7 @@ import io
 import os
 import numpy as np
 import time
+from collections import Counter
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +67,12 @@ NULL_THRESHOLD_FOR_KEY = 5.0
 
 # Relationships below this confidence score are rejected
 CONFIDENCE_THRESHOLD = 0.7
+
+def _normalize_name(name: str) -> str:
+    """Normalize names for comparison only. Never use output for display."""
+    if not name:
+        return ""
+    return name.lower().strip().replace(" ", "_").replace("-", "_")
 
 
 # ====================================================================
@@ -199,7 +206,7 @@ def validate_er_model(er_model: dict) -> list:
 # ====================================================================
 # RELATIONSHIP DETECTION  (AI-powered with fallback)
 # ====================================================================
-def detect_relationships(schemas):
+def detect_relationships(schemas, source_dfs=None):
     """
     Detect relationships and produce a normalized ER model using AI.
     Falls back to rule-based detection if AI fails or returns bad JSON.
@@ -260,6 +267,11 @@ def detect_relationships(schemas):
         "Step 1 — Analyse each table: identify if it is denormalized and what conceptual "
         "entities are embedded in it.\n"
         "Step 2 — Decompose denormalized tables into normalized entities with proper PKs/FKs.\n"
+        "Step 2b — Choose ONE modeling approach and stick to it:\n"
+        "  • If decomposing into normalized entities → use 3NF: extract all entities, "
+        "    the highest-grain entity becomes the fact candidate.\n"
+        "  • Do NOT create both a bridge/junction table AND a separate fact_table for the same grain.\n"
+        "  • The fact candidate is the entity with the most outgoing FKs and numeric measures.\n"
         "Step 3 — Determine relationships (1:1, 1:M, M:N) between entities.\n"
         "Step 4 — Assign confidence scores to each relationship.\n"
         "Step 5 — Build a single-line cardinality diagram.\n\n"
@@ -334,15 +346,19 @@ def detect_relationships(schemas):
             try:
                 response = client.chat.completions.create(
                     model=AI_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[
+                        {"role": "system", "content": "Return ONLY valid JSON. No markdown. No explanations. No trailing commas."},
+                        {"role": "user", "content": prompt}
+                    ],
                     temperature=0,
-                    max_tokens=8000
+                    max_tokens=5000
                 )
                 content   = response.choices[0].message.content.strip()
                 ai_result = _extract_json_from_text(content)
 
                 logging.info("✅ AI ER model received — validating structure...")
-                return _transform_ai_result_to_standard_format(ai_result, schemas)
+                result = _transform_ai_result_to_standard_format(ai_result, schemas)
+                return verify_and_clean_model(result, schemas, source_dfs or {})
 
             except Exception as e:
                 if "429" in str(e) or "rate_limit" in str(e).lower():
@@ -433,10 +449,11 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
 
             attr_name      = attr.get("name", "")
             attr_name_low  = attr_name.strip().lower()
-
-            # Deterministic surrogate detection:
-            # If the attribute name does not exist in any source schema column → surrogate
+            
             is_surrogate_deterministic = attr_name_low not in source_column_names
+
+            attr["is_surrogate"] = is_surrogate_deterministic
+            
 
             # Override whatever the AI said with our deterministic check
             attr["is_surrogate"] = is_surrogate_deterministic
@@ -463,16 +480,41 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
                 raw_ref = attr.get("references", "") or ""
                 if not raw_ref:  # skip FK with no reference
                     continue
-                if "." in raw_ref:
+                # Handle both string format ("Table.column") and dict format ({"table": "X", "column": "Y"})
+                if isinstance(raw_ref, dict):
+                    ref_table = raw_ref.get("table") or raw_ref.get("entity") or raw_ref.get("name") or ""
+                    ref_col   = raw_ref.get("column") or raw_ref.get("field") or None
+                elif isinstance(raw_ref, str) and "." in raw_ref:
                     ref_table, ref_col = raw_ref.split(".", 1)
-                else:
+                elif isinstance(raw_ref, str):
                     ref_table, ref_col = raw_ref, None
+                else:
+                    logging.warning(f"⚠️ Unrecognized references format for {attr_name}: {raw_ref}")
+                    continue
+
+                if not ref_table:
+                    continue
 
                 foreign_keys.append({
                     "column":            attr_name,
                     "references_table":  ref_table.strip().lower(),
-                    "references_column": ref_col
+                    "references_column": ref_col.strip() if isinstance(ref_col, str) else ref_col
                 })
+
+        # Only first surrogate should be PK — rest are regular attributes
+        if len(surrogate_keys) > 1:
+            observations.append(
+                f"WARNING: {entity_name} had {len(surrogate_keys)} surrogates — "
+                f"keeping only '{surrogate_keys[0]}' as PK surrogate"
+            )
+            for a in attributes:
+                if a.get("is_surrogate") and a.get("name") != surrogate_keys[0]:
+                    a["is_surrogate"] = False
+                    a["display_label"] = a["name"]
+                    a["tooltip"] = f"Source column from {entity_data.get('derived_from', 'unknown')}"
+            surrogate_keys = [surrogate_keys[0]]
+
+            
 
         tables_info.append({
             "table":          entity_name,
@@ -483,7 +525,6 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
             "foreign_keys":   foreign_keys,
             "attributes":     attributes
         })
-
     # ------------------------------------------------------------------
     # 4. Filter relationships by confidence
     # ------------------------------------------------------------------
@@ -494,7 +535,8 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
         if not isinstance(rel, dict):
             continue
 
-        confidence = float(rel.get("confidence", 0.0))
+        raw_conf = rel.get("confidence", 0.0)
+        confidence = float(raw_conf) if raw_conf is not None else 0.0
 
         if confidence < CONFIDENCE_THRESHOLD:
             logging.warning(
@@ -555,6 +597,294 @@ def _find_source_file(col_name_lower: str, schemas: list) -> str:
                 return schema.get("table_name", "unknown")
     return "unknown"
 
+
+def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: dict) -> dict:
+    """
+    Deterministic verification layer applied after AI transform, before saving.
+    Validates PKs, FKs, relationships, fact selection, and entity names.
+    Normalizes for comparison only — never mutates display fields.
+    """
+    observations = relationship_info.get("observations", [])
+
+    # ── Normalized lookup structures ─────────────────────────────
+    schema_map  = {_normalize_name(s["table_name"]): s for s in schemas}
+    source_norm = {_normalize_name(k): v for k, v in source_dfs.items()}
+
+    
+
+    # ── BLOCK 1: PK Validation ───────────────────────────────────
+    invalid_pk_targets = set()  # normalized names of tables with no valid PK after validation
+
+    for entity in relationship_info.get("tables", []):
+        display      = entity.get("table", "")
+        display_obs = display.lower()
+        key          = _normalize_name(display)
+        derived_norm = _normalize_name(entity.get("derived_from", ""))
+        source_schema = schema_map.get(derived_norm) or schema_map.get(key)
+
+        raw_analysis = relationship_info.get("raw_entity_analysis", {})
+        # find the raw entry for this entity's source
+        raw_entry = raw_analysis.get(entity.get("derived_from", ""), {})
+        is_denormalized = raw_entry.get("is_denormalized", False)
+
+        if not source_schema:
+            continue
+
+        row_count   = source_schema.get("row_count", 0)
+        col_lookup  = {
+            _normalize_name(c["column_name"]): c
+            for c in source_schema.get("columns", [])
+        }
+
+        validated_pks = []
+
+        for pk in entity.get("primary_keys", []):
+            pk_norm = _normalize_name(pk)
+            col     = col_lookup.get(pk_norm)
+            if not col:
+                observations.append(
+                    f"REJECTED_PK: {display_obs}.{pk} | reason: column not found in source schema"
+                )
+                continue
+
+            # Check 0: reject multi-valued columns
+            sample_vals = col.get("sample_values", [])
+            if any(
+                isinstance(v, str) and ("|" in v or ("," in v and len(v.split(",")) > 2))
+                for v in sample_vals
+            ):
+                observations.append(
+                    f"REJECTED_PK: {display_obs}.{pk} | reason: multi-valued column (contains separators)"
+                )
+                continue
+
+            null_pct       = col.get("null_percentage", 100.0)
+            distinct_count = col.get("distinct_count", 0)
+            data_type      = col.get("data_type", "").lower()
+
+            # Check 1: nulls
+            if null_pct > 0:
+                observations.append(
+                    f"REJECTED_PK: {display_obs}.{pk} | reason: null_percentage={null_pct}% > 0%"
+                )
+                continue
+
+            # Check 2: distinctness
+            if not is_denormalized and row_count > 0 and (distinct_count / row_count) < 0.98:
+                observations.append(
+                    f"REJECTED_PK: {display_obs}.{pk} | "
+                    f"reason: distinct_ratio={distinct_count}/{row_count} < 0.98"
+                )
+                continue
+
+            # Check 3: float/double — allow if sample values are integer-like
+            if "float" in data_type or "double" in data_type:
+                sample_vals = col.get("sample_values", [])
+                all_integer_like = all(
+                    str(v).replace(".0", "").isdigit()
+                    for v in sample_vals if v is not None
+                )
+                if not all_integer_like:
+                    observations.append(
+                        f"REJECTED_PK: {display_obs}.{pk} | "
+                        f"reason: data_type is {data_type} with non-integer values"
+                    )
+                    continue
+
+            validated_pks.append(pk)
+
+        entity["primary_keys"] = validated_pks
+
+        if not validated_pks and entity.get("surrogate_keys"):
+            # Promote first surrogate to PK
+            promoted = entity["surrogate_keys"][0]
+            entity["primary_keys"] = [promoted]
+            invalid_pk_targets.discard(key)
+            observations.append(
+                f"INFO: {display_obs} — promoted surrogate '{promoted}' to primary key"
+            )
+    # ── BLOCK 2: FK + Relationship Validation ────────────────────
+    cleaned_relationships = []
+
+    for rel in relationship_info.get("relationships", []):
+        from_table  = rel.get("from_table", "")
+        from_obs    = from_table.lower()
+        to_table    = rel.get("to_table", "")
+        to_obs      = to_table.lower()
+        from_col    = rel.get("from_column", "")
+        to_col      = rel.get("to_column", "")
+        from_norm   = _normalize_name(from_table)
+        to_norm     = _normalize_name(to_table)
+
+        reject_reason = None
+
+        # Gate: target table must have a valid PK
+        if to_norm in invalid_pk_targets:
+            reject_reason = f"target table '{to_table}' has no valid primary key"
+
+        # Check A: type compatibility
+        if not reject_reason:
+            from_schema = schema_map.get(from_norm)
+            to_schema   = schema_map.get(to_norm)
+
+            if from_schema and to_schema:
+                from_col_lookup = {
+                    _normalize_name(c["column_name"]): c
+                    for c in from_schema.get("columns", [])
+                }
+                to_col_lookup = {
+                    _normalize_name(c["column_name"]): c
+                    for c in to_schema.get("columns", [])
+                }
+
+                from_col_meta = from_col_lookup.get(_normalize_name(from_col))
+                to_col_meta   = to_col_lookup.get(_normalize_name(to_col))
+
+                if from_col_meta and to_col_meta:
+                    from_type = from_col_meta.get("data_type", "").lower()
+                    to_type   = to_col_meta.get("data_type", "").lower()
+
+                    numeric = {"int", "double", "float", "bigint", "long", "decimal"}
+                    string  = {"string", "varchar", "nvarchar", "text", "char"}
+
+                    from_is_numeric = any(t in from_type for t in numeric)
+                    from_is_string  = any(t in from_type for t in string)
+                    to_is_numeric   = any(t in to_type for t in numeric)
+                    to_is_string    = any(t in to_type for t in string)
+
+                    if from_is_string and to_is_numeric:
+                        reject_reason = f"type_mismatch ({from_type} vs {to_type})"
+                    elif from_is_numeric and to_is_string:
+                        reject_reason = f"type_mismatch ({from_type} vs {to_type})"
+
+                # Check C: cardinality sanity
+                if not reject_reason and from_col_meta and to_schema:
+                    child_distinct  = from_col_meta.get("distinct_count", 0)
+                    parent_row_count = to_schema.get("row_count", 0)
+                    if parent_row_count > 0 and child_distinct > parent_row_count * 2:
+                        reject_reason = (
+                            f"cardinality_impossible: child_distinct={child_distinct} > "
+                            f"parent_rows={parent_row_count} * 2"
+                        )
+
+        # Check B: referential sampling (only when DataFrames available)
+        if not reject_reason:
+            child_df  = source_norm.get(from_norm)
+            parent_df = source_norm.get(to_norm)
+
+            if child_df is not None and parent_df is not None:
+                try:
+                    if from_col in child_df.columns and to_col in parent_df.columns:
+                        child_vals  = child_df[from_col].dropna().unique()[:1000]
+                        parent_set  = set(parent_df[to_col].dropna().unique())
+                        if len(child_vals) > 0:
+                            match_rate = sum(1 for v in child_vals if v in parent_set) / len(child_vals)
+                            if match_rate < 0.95:
+                                reject_reason = (
+                                    f"low_match_rate={match_rate:.2f} < 0.95"
+                                )
+                except Exception as e:
+                    logging.warning(f"Referential check skipped for {from_table}.{from_col}: {e}")
+
+        if reject_reason:
+            observations.append(
+                f"REJECTED_FK: {from_obs}.{from_col} → {to_obs}.{to_col} "
+                f"| reason: {reject_reason}"
+            )
+        else:
+            cleaned_relationships.append(rel)   # original object, not mutated
+
+    relationship_info["relationships"] = cleaned_relationships
+
+    # ── BLOCK 3: Fact Table Validation + Override ─────────────────
+    inbound_refs = Counter(
+        _normalize_name(r.get("to_table", ""))
+        for r in cleaned_relationships
+    )
+
+    all_row_counts  = []
+
+    for entity in relationship_info.get("tables", []):
+        derived_norm  = _normalize_name(entity.get("derived_from", ""))
+        source_schema = schema_map.get(derived_norm)
+        if source_schema:
+            all_row_counts.append(source_schema.get("row_count", 0))
+
+    median_row_count = sorted(all_row_counts)[len(all_row_counts) // 2] if all_row_counts else 0
+    best_candidate     = None
+    best_row_count     = -1
+    best_measure_count = -1
+    for entity in relationship_info.get("tables", []):
+        display      = entity.get("table", "")
+        display_obs = display.lower()
+        key          = _normalize_name(display)
+        derived_norm = _normalize_name(entity.get("derived_from", ""))
+        source_schema = schema_map.get(derived_norm) or schema_map.get(key)
+ 
+        outgoing_fk_count = len(entity.get("foreign_keys", []))
+        row_count         = source_schema.get("row_count", 0) if source_schema else 0
+
+        if not source_schema:
+            continue
+        # Hard exclude: if a table is heavily referenced it's a dimension, not a fact
+        if inbound_refs[key] >= 2:
+            logging.info(f"   FACT GATE FAILED: {display} | inbound_refs={inbound_refs[key]} >= 2")
+            continue
+        # Count numeric non-PK non-FK columns from source schema
+        pk_set = set(_normalize_name(p) for p in entity.get("primary_keys", []))
+        fk_set = set(_normalize_name(f["column"]) for f in entity.get("foreign_keys", []))
+        numeric_types = {"int", "double", "float", "decimal", "bigint", "long"}
+
+        measure_count = sum(
+            1 for col in source_schema.get("columns", [])
+            if _normalize_name(col["column_name"]) not in pk_set
+            and _normalize_name(col["column_name"]) not in fk_set
+            and any(t in col.get("data_type", "").lower() for t in numeric_types)
+        )
+
+        # Deterministic gate
+        if outgoing_fk_count < 2:
+            continue
+        if measure_count < 1:
+            continue
+        if row_count < median_row_count:
+            continue
+
+        # ... inside loop, replace the winner block:
+        if measure_count > best_measure_count or \
+        (measure_count == best_measure_count and row_count > best_row_count):
+            best_row_count     = row_count
+            best_measure_count = measure_count
+            best_candidate     = key
+
+    relationship_info["fact_entity_override"] = best_candidate
+
+    if best_candidate is None:
+        observations.append(
+            "WARNING: No valid fact table candidate found. Model returned as ER-only."
+        )
+    else:
+        logging.info(f"   ✅ Fact entity override: {best_candidate}")
+
+    # ── BLOCK 4: Entity Name Guard ────────────────────────────────
+    valid_tables = []
+    for entity in relationship_info.get("tables", []):
+        display      = entity.get("table", "")
+        display_obs  = display.lower()
+        derived_norm = _normalize_name(entity.get("derived_from", ""))
+
+        if derived_norm and derived_norm not in schema_map:
+            observations.append(
+                f"REJECTED_ENTITY: {display_obs} | "
+                f"derived_from '{entity.get('derived_from')}' not traceable to any source schema"
+            )
+            continue
+
+        valid_tables.append(entity)   # original object
+
+    relationship_info["tables"]       = valid_tables
+    relationship_info["observations"] = observations
+    return relationship_info
 
 # ====================================================================
 # RULE-BASED FALLBACK
@@ -784,8 +1114,20 @@ def _extract_json_from_text(text):
     if not matches:
         raise ValueError("No JSON object found in AI response")
 
-    candidate = max(matches, key=len)
-    return json.loads(candidate)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        logging.error("⚠️ AI returned malformed JSON. Truncating at last complete brace.")
+
+        # Try trimming from the end progressively
+        for i in range(len(candidate) - 1, 0, -1):
+            if candidate[i] == "}":
+                try:
+                    return json.loads(candidate[:i+1])
+                except:
+                    continue
+
+        raise
 
 
 # ====================================================================
@@ -886,7 +1228,9 @@ def extract_schema_metadata(df, table_name, file_path):
       - Columns with null_percentage > NULL_THRESHOLD_FOR_KEY are NEVER keys.
     """
     total_rows      = len(df)
-    table_name_clean = table_name.rsplit(".", 1)[0] if "." in table_name else table_name
+    table_name_clean = (
+        table_name.rsplit(".", 1)[0] if "." in table_name else table_name
+    ).lower().strip().replace(" ", "_").replace("-", "_")
 
     schema_info = {
         "table_name":           table_name_clean,
@@ -1129,9 +1473,12 @@ def analyze_schemas_with_ai(schemas):
             try:
                 response = client.chat.completions.create(
                     model=AI_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[
+                        {"role": "system", "content": "Return ONLY valid JSON. No markdown. No explanations. No trailing commas."},
+                        {"role": "user", "content": prompt}
+                    ],
                     temperature=0,
-                    max_tokens=8000
+                    max_tokens=5000
                 )
                 content = response.choices[0].message.content.strip()
                 return _extract_json_from_text(content)
