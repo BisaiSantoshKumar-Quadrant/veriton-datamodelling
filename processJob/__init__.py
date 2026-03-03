@@ -595,7 +595,7 @@ def _run_er_modeling_and_save(
         )
         
         enriched_tables.append({
-            "table_name":     table_name,
+            "table_name": table_name,
             "table_type":    "SOURCE",   # was "DIM"
             "is_source_only": True,      # ADD THIS
             "has_normalized_counterpart": has_normalized_counterpart,  # ADD THIS
@@ -633,7 +633,7 @@ def _run_er_modeling_and_save(
     # Virtual fact table
     if fact_entity is not None:
         enriched_tables.append({
-            "table_name":     "fact_table",
+            "table_name":     fact_entity.get("table", "fact_table").lower(),
             "table_type":     "FACT",
             # ── Issue 5 fix: ensure derived_from is always a resolvable source table name
             "derived_from": (
@@ -674,12 +674,18 @@ def _run_er_modeling_and_save(
             derived_from = norm_table.get("derived_from", "")
 
             # Skip physical source tables (already added above) and fact_table
-            if not entity_name or entity_name == "fact_table":
+            if not entity_name:
                 continue
-            # Skip if it's a physical source table name (not a derived entity)
-            source_names = [s.get("table_name", "") for s in schemas]
-            if entity_name in source_names:
+            if entity_name == "fact_table":
                 continue
+            if fact_entity_name and entity_name == fact_entity_name:
+                continue
+
+            derived = norm_table.get("derived_from", "")
+            if not derived:
+                source_names = [s.get("table_name", "") for s in schemas]
+                if entity_name in source_names:
+                    continue
 
             enriched_tables.append({
                 "table_name":      entity_name,
@@ -715,7 +721,7 @@ def _run_er_modeling_and_save(
         if not to_table:  # skip malformed FKs
             continue
         enriched_relationships.append({
-            "from_table":        "fact_table",
+            "from_table": fact_entity.get("table", "fact_table").lower() if fact_entity else "fact_table",
             "from_column":       fk.get("column", ""),
             "to_table":          fk.get("references_table", ""),
             "to_column":         fk.get("references_column", ""),
@@ -731,9 +737,10 @@ def _run_er_modeling_and_save(
         })
 
     # Also carry through any AI-detected entity-level relationships
+    fact_name = fact_entity.get("table", "").lower() if fact_entity else "fact_table"
     for rel in relationship_info.get("relationships", []):
-        # Avoid duplicating fact→dim ones already added above
-        if rel.get("from_table") != "fact_table":
+        from_t = rel.get("from_table", "").lower()
+        if from_t != "fact_table" and from_t != fact_name:
             enriched_relationships.append(rel)
     normalized_table_names = [
         t["table_name"] for t in enriched_tables
@@ -752,7 +759,7 @@ def _run_er_modeling_and_save(
         # Model metadata
         "model": {
             "type": "STAR_SCHEMA" if fact_entity else "ER_ONLY",
-            "fact_table": "fact_table" if fact_entity else None,
+            "fact_table": fact_entity.get("table", "fact_table").lower() if fact_entity else None,
             "dimension_tables": all_dim_tables
         },
 
@@ -777,7 +784,7 @@ def _run_er_modeling_and_save(
                 if fact_entity
                 else len(enriched_tables)
             ),
-            "fact_tables":            ["fact_table"] if fact_entity else [],
+            "fact_tables": [fact_entity.get("table", "fact_table").lower()] if fact_entity else [],
             "dimension_tables":       all_dim_tables,
             "normalized_entities":    normalized_table_names,
             "physical_source_tables": physical_table_names,
@@ -856,6 +863,10 @@ def _run_er_modeling_and_save(
     logging.info("=" * 80)
     for rel in enriched_relationships:
         logging.info(f"DEBUG rel: from={rel.get('from_table')} to={rel.get('to_table')} col={rel.get('from_column')}")
+
+
+    logging.info(f"   DEBUG enriched entity names: {[t['table_name'] for t in enriched_tables]}")
+    logging.info(f"   DEBUG relationship to_tables: {[r.get('to_table') for r in enriched_relationships]}")
 
     validation_errors = validate_er_model(complete_analysis)
     critical_errors   = [e for e in validation_errors if e.startswith("CRITICAL")]

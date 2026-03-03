@@ -262,16 +262,25 @@ def detect_relationships(schemas, source_dfs=None):
         "7. For every relationship, assign a confidence score 0.0–1.0. "
         "OMIT any relationship where confidence < 0.7.\n"
         "8. Output ONLY valid JSON. No markdown. No explanation outside the JSON.\n\n"
+        "9. Name the fact entity 'fact_<grain>' (e.g. fact_appointment, fact_visit, "
+        "   fact_enrollment). Never use the generic name 'fact_table'.\n"
+        "10. If an entity is nominated as the fact candidate, do NOT also create a separate "
+        "    DIM entity derived from the same source with overlapping FK columns. "
+        "    The fact entity IS that grain — it must not have a dimension twin.\n"
+        "11. If the fact entity contains date/datetime columns, extract a 'date_dimension' "
+        "    with attributes: Date, Year, Month, Day, Quarter, DayOfWeek. "
+        "    The fact entity keeps a DateKey FK referencing date_dimension.\n"
 
         "Steps:\n"
         "Step 1 — Analyse each table: identify if it is denormalized and what conceptual "
         "entities are embedded in it.\n"
         "Step 2 — Decompose denormalized tables into normalized entities with proper PKs/FKs.\n"
         "Step 2b — Choose ONE modeling approach and stick to it:\n"
-        "  • If decomposing into normalized entities → use 3NF: extract all entities, "
-        "    the highest-grain entity becomes the fact candidate.\n"
-        "  • Do NOT create both a bridge/junction table AND a separate fact_table for the same grain.\n"
-        "  • The fact candidate is the entity with the most outgoing FKs and numeric measures.\n"
+        "  • The highest-grain entity (most FKs + numeric measures) becomes the fact entity.\n"
+        "  • Name it fact_<grain> (e.g. fact_appointment). Never 'fact_table'.\n"
+        "  • Do NOT also create a DIM entity for that same grain from the same source.\n"
+        "  • All other embedded concepts become dimension entities.\n"
+"  • Do NOT create both a bridge/junction table AND a fact entity for the same grain.\n"
         "Step 3 — Determine relationships (1:1, 1:M, M:N) between entities.\n"
         "Step 4 — Assign confidence scores to each relationship.\n"
         "Step 5 — Build a single-line cardinality diagram.\n\n"
@@ -859,6 +868,40 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
 
     relationship_info["fact_entity_override"] = best_candidate
 
+    # ── BLOCK 3b: Remove ghost DIM that duplicates the fact grain ────
+    if best_candidate:
+        fact_entity = next(
+            (e for e in relationship_info["tables"]
+            if _normalize_name(e.get("table", "")) == best_candidate),
+            None
+        )
+        if fact_entity:
+            fact_derived = _normalize_name(fact_entity.get("derived_from", ""))
+            fact_fk_set  = {_normalize_name(f["column"]) for f in fact_entity.get("foreign_keys", [])}
+
+            ghost_keys = set()
+            for entity in relationship_info["tables"]:
+                if _normalize_name(entity.get("table", "")) == best_candidate:
+                    continue
+                if _normalize_name(entity.get("derived_from", "")) != fact_derived:
+                    continue
+                entity_fk_set = {_normalize_name(f["column"]) for f in entity.get("foreign_keys", [])}
+                if not fact_fk_set:
+                    continue
+                overlap = len(fact_fk_set & entity_fk_set) / len(fact_fk_set)
+                if overlap >= 0.7:
+                    ghost_keys.add(_normalize_name(entity.get("table", "")))
+                    observations.append(
+                        f"REMOVED_GHOST_DIM: {entity.get('table', '').lower()} | "
+                        f"reason: duplicate of fact grain '{best_candidate}' "
+                        f"({overlap:.0%} FK overlap, same derived_from)"
+                    )
+
+            relationship_info["tables"] = [
+                e for e in relationship_info["tables"]
+                if _normalize_name(e.get("table", "")) not in ghost_keys
+            ]
+
     if best_candidate is None:
         observations.append(
             "WARNING: No valid fact table candidate found. Model returned as ER-only."
@@ -872,13 +915,21 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
         display      = entity.get("table", "")
         display_obs  = display.lower()
         derived_norm = _normalize_name(entity.get("derived_from", ""))
+        logging.info(f"   BLOCK4 CHECK: {display_obs} | derived_norm={derived_norm} | in schema_map={derived_norm in schema_map} | schema_map_keys={list(schema_map.keys())}")
 
-        if derived_norm and derived_norm not in schema_map:
-            observations.append(
-                f"REJECTED_ENTITY: {display_obs} | "
-                f"derived_from '{entity.get('derived_from')}' not traceable to any source schema"
+
+        if derived_norm:
+            exact_match = derived_norm in schema_map
+            fuzzy_match = any(
+                derived_norm in k or k in derived_norm
+                for k in schema_map
             )
-            continue
+            if not exact_match and not fuzzy_match:
+                observations.append(
+                    f"REJECTED_ENTITY: {display_obs} | "
+                    f"derived_from '{entity.get('derived_from')}' not traceable to any source schema"
+                )
+                continue
 
         valid_tables.append(entity)   # original object
 
