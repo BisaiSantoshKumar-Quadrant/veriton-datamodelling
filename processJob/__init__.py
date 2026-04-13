@@ -221,10 +221,12 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                         )
                     if df is not None and not df.empty:
                         metadata = extract_schema_metadata(df, filename, blob_path)
+                        base_name = os.path.splitext(filename)[0].lower().strip().replace(" ", "_").replace("-", "_")
+                        source_dfs[base_name] = df
 
                 elif file_ext == ".parquet":
-                    df = pd.read_parquet(io.BytesIO(file_data))
-                    if df is not None and not df.empty:
+                    df = pd.read_parquet(io.BytesIO(file_data), engine="pyarrow")
+                    if df is not None and not df.empty and len(df.columns) > 1:
                         metadata = extract_schema_metadata(df, filename, blob_path)
                         
                         base_name = os.path.splitext(filename)[0].lower().strip().replace(" ", "_").replace("-", "_")
@@ -283,7 +285,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             schemas, container_client, job_folder,
             job_data, job_status_blob,
             user_id, job_id, processed_count, failed_files,
-            rel_client, norm_client, source_dfs={}
+            rel_client, norm_client, source_dfs=source_dfs
         )
 
     except Exception as e:
@@ -294,8 +296,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             job_data["failed_at"] = datetime.utcnow().isoformat()
             if job_status_blob:
                 job_status_blob.upload_blob(json.dumps(job_data, indent=2), overwrite=True)
-        except Exception:
-            pass
+        except Exception as status_err:
+            logging.error(
+                f"❌ Additionally failed to write error status to blob: {status_err}"
+            )
         return _error_response(str(e), 500)
 
 
@@ -376,6 +380,26 @@ def _run_er_modeling_and_save(
 
     relationship_info = detect_relationships(schemas, source_dfs)
 
+    # TEMPORARY DEBUG
+    for t in relationship_info.get("tables", []):
+        logging.info(
+            f"DEBUG POST-VERIFY table: {t.get('table')} | "
+            f"derived_from: {t.get('derived_from')} | "
+            f"pks: {t.get('primary_keys')} | "
+            f"surrogates: {t.get('surrogate_keys')}"
+        )
+    logging.info(f"DEBUG relationships: {relationship_info.get('relationships')}")
+    logging.info(f"DEBUG fact_override: {relationship_info.get('fact_entity_override')}")
+
+    # Write relationship state — works for 1 file or many
+    has_relationships = len(relationship_info.get("relationships", [])) > 0
+    state_blob = rel_client.get_blob_client(f"{user_id}/{job_id}/relationship_state.json")
+    state_blob.upload_blob(
+        json.dumps({"is_relation_exist": has_relationships}, indent=2),
+        overwrite=True
+    )
+    logging.info(f"✅ relationship_state.json written — is_relation_exist: {has_relationships}")
+
     model_source       = relationship_info.get("model_source", "ai")
     ai_retry_available = relationship_info.get("ai_retry_available", False)
 
@@ -383,6 +407,9 @@ def _run_er_modeling_and_save(
     logging.info(f"   ai_retry_available = {ai_retry_available}")
     logging.info(f"   entities           = {len(relationship_info.get('tables', []))}")
     logging.info(f"   relationships      = {len(relationship_info.get('relationships', []))}")
+
+    
+
 
     # ============================================================
     # STEP 3.5: BUILD STAR SCHEMA FROM NORMALIZED ENTITIES
@@ -396,37 +423,45 @@ def _run_er_modeling_and_save(
     existing_columns     = []
     all_dim_tables       = []
 
-    source_names = {s.get("table_name", "") for s in schemas}
+    source_names = {s.get("table_name", "").lower() for s in schemas}
     for t in relationship_info.get("tables", []):
         logging.info(f"DEBUG table entry: {t.get('table')} | type: {type(t.get('table'))}")
     normalized_tables = [
         t for t in relationship_info.get("tables", [])
         if isinstance(t.get("table"), str)
-        and t.get("table", "").lower() != "fact_table"
         and t.get("table")
+        and t.get("derived_from")
     ]
     # Identify candidate fact table:
     # Entity with the most outgoing FKs = transactional grain
     def outgoing_fk_count(t):
         return len(t.get("foreign_keys", []))
 
-    # All entities with outgoing FKs are candidates
     candidates = [t for t in normalized_tables if outgoing_fk_count(t) > 0]
 
     fact_override = relationship_info.get("fact_entity_override")
-    if fact_override is not None:
-        fact_entity = next(
-            (t for t in normalized_tables
-            if t.get("table", "").lower().strip().replace(" ", "_").replace("-", "_") == fact_override),
-            None
-        )
-        if fact_entity is None:
-            logging.warning(f"fact_entity_override '{fact_override}' not found in normalized_tables, falling back")
-            fact_entity = max(candidates, key=outgoing_fk_count) if candidates else None
-    else:
-        fact_entity = None  # ER-only model, no fact table
+    fact_entity = None
 
-    fact_entity_name = fact_entity.get("table").lower() if fact_entity else None
+    if fact_override is not None:
+        for t in normalized_tables:
+            raw = t.get("table", "")
+            normalized = raw.lower().strip().replace(" ", "_").replace("-", "_")
+            if normalized == fact_override:
+                fact_entity = t
+                break
+
+        if fact_entity is None:
+            logging.warning(
+                f"fact_entity_override '{fact_override}' not found in normalized_tables. "
+                f"Available: {[t.get('table') for t in normalized_tables]}. "
+                f"No fact table will be assigned — model will be ER-only."
+            )
+
+    fact_entity_name = (
+        fact_entity.get("table", "").lower()
+        if fact_entity and fact_entity.get("table")
+        else None
+    )
     logging.info(f"   🎯 Candidate fact entity: {fact_entity_name}")
 
     # Build fact table FKs from the fact entity's FK columns
@@ -472,7 +507,12 @@ def _run_er_modeling_and_save(
                 ref_table = fk.get("references_table")
 
                 if isinstance(ref_table, dict):
-                    ref_table = ref_table.get("table") or ref_table.get("name") or ""
+                    ref_table = (
+                        ref_table.get("table")
+                        or ref_table.get("name")
+                        or ref_table.get("entity")
+                        or ""
+                    )
 
                 if not ref_table:  # skip if still empty
                     continue
@@ -482,14 +522,40 @@ def _run_er_modeling_and_save(
                     "references_table": ref_table.lower() if ref_table else "",
                     "references_column": fk.get("references_column")
                 })
+        # Inject DateKey FK if date_dimension exists
+        date_dim_exists = any(
+            _normalize_name(t.get("table", "")) == "date_dimension"
+            for t in relationship_info.get("tables", [])
+        )
+        if date_dim_exists:
+            if "DateKey" not in existing_columns:
+                existing_columns.append("DateKey")
+
+                virtual_fact_columns.append({
+                    "column_name": "DateKey",
+                    "data_type": "int",
+                    "nullable": False,
+                    "null_count": 0,
+                    "null_percentage": 0.0,
+                    "distinct_count": 0,
+                    "cardinality_percentage": 0.0,
+                    "is_potential_key": False,
+                    "is_foreign_key": True,
+                    "is_primary_key": False,
+                    "sample_values": []
+                })
+
+                virtual_fact_fks.append({
+                    "column": "DateKey",
+                    "references_table": "date_dimension",
+                    "references_column": "DateKey"
+                })
         # 3. Add numeric measure columns from the fact entity
         # These are the actual measurable values — quantity, amount, price, etc.
         numeric_types = {"int", "double", "float", "decimal", "bigint", "long", "number"}
         for attr in fact_entity.get("attributes", []):
             attr_name  = attr.get("name", "")
             attr_type  = attr.get("data_type", "").lower()
-            is_pk      = attr_name in fact_pk
-            is_fk      = attr.get("is_foreign_key", False)
             is_numeric = any(t in attr_type for t in numeric_types)
             is_high_null = attr.get("null_percentage", 0.0) > 5.0
 
@@ -517,16 +583,61 @@ def _run_er_modeling_and_save(
                 "sample_values":          []
             })
 
+        
+            
+        # 4. Add string degenerate dimensions (non-PK, non-FK, non-numeric)
+        # date_source_cols = {
+        #     a.get("name", "").lower()
+        #     for t in relationship_info.get("tables", [])
+        #     if _normalize_name(t.get("table", "")) == "date_dimension"
+        #     for a in t.get("attributes", [])
+        #     if not a.get("is_surrogate", False)
+        #     and a.get("name", "").lower() not in {"year", "month", "day", "quarter", "dayofweek"}
+        # }
+        for attr in fact_entity.get("attributes", []):
+            attr_name = attr.get("name", "")
+            attr_type = attr.get("data_type", "").lower()
+            is_numeric = any(t in attr_type for t in numeric_types)
+            is_high_null = attr.get("null_percentage", 0.0) > 5.0
+
+            if attr_name in existing_columns:
+                continue
+            if is_numeric:
+                continue
+            if is_high_null:
+                continue
+            if attr.get("is_foreign_key", False):
+                continue
+            if attr.get("is_surrogate", False):
+                continue
+            if "date" in attr_name.lower() and "DateKey" in existing_columns:
+                continue
+
+            existing_columns.append(attr_name)
+            virtual_fact_columns.append({
+                "column_name":            attr_name,
+                "data_type":              attr.get("data_type", "string"),
+                "nullable":               True,
+                "null_count":             0,
+                "null_percentage":        0.0,
+                "distinct_count":         0,
+                "cardinality_percentage": 0.0,
+                "is_potential_key":       False,
+                "is_foreign_key":         False,
+                "is_primary_key":         False,
+                "is_measure":             False,
+                "sample_values":          []
+            })
+
     # Dimension tables = all normalized entities EXCEPT the fact entity
     if fact_entity is not None:
         all_dim_tables = [
-            t.get("table").lower() for t in normalized_tables
-            if t.get("table") != fact_entity_name
-            ]
-    else:
-        all_dim_tables = [
-            t.get("table", "").lower() for t in normalized_tables
+            t.get("table", "").lower()
+            for t in normalized_tables
+            if t.get("table", "").lower() != fact_entity_name
         ]
+    else:
+        all_dim_tables = []
         logging.info("   ℹ️  No fact entity found — outputting ER-only model")
 
     # Row count = row count of the source file the fact entity came from
@@ -550,6 +661,10 @@ def _run_er_modeling_and_save(
     logging.info("=" * 80)
 
     enriched_tables = []
+    table_lookup = {
+        t.get("table", "").lower(): t
+        for t in relationship_info.get("tables", [])
+    }
 
     # Dimension tables
     for schema in schemas:
@@ -557,31 +672,37 @@ def _run_er_modeling_and_save(
         columns    = schema.get("columns", [])
         row_count  = schema.get("row_count", 0)
 
-        table_info = next(
-            (t for t in relationship_info.get("tables", [])
-            if t.get("table", "").lower() == table_name.lower()),
-            None
-        )
+        
+
+        table_info = table_lookup.get(table_name.lower())
+
         if not table_info or not table_info.get("primary_keys"):
             raw = relationship_info.get("raw_entity_analysis", {}).get(table_name, {})
             primary_keys = [
                 c["name"] for c in raw.get("columns", [])
-                if "pk" in c.get("observations", "").lower()
-                or "suitable as pk" in c.get("observations", "").lower()
-                or "unique identifier" in c.get("observations", "").lower()
+                if (
+                    "pk" in c.get("observations", "").lower()
+                    or "suitable as pk" in c.get("observations", "").lower()
+                    or "unique identifier" in c.get("observations", "").lower()
+                )
+                and c.get("null_percentage", 100.0) <= NULL_THRESHOLD_FOR_KEY  # ← null guard
             ]
-            # ── Issue 4 fix: final fallback — read is_primary_key / is_potential_key
-            # directly from the schema columns when neither table_info nor raw analysis
-            # could identify PKs.
             if not primary_keys:
                 primary_keys = [
                     col.get("column_name", "")
                     for col in columns
-                    if col.get("is_primary_key") or col.get("is_potential_key")
+                    if (col.get("is_primary_key") or col.get("is_potential_key"))
+                    and col.get("null_percentage", 100.0) <= NULL_THRESHOLD_FOR_KEY
                 ]
             surrogate_keys = []
         else:
-            primary_keys = table_info.get("primary_keys", [])
+            primary_keys = [
+                pk for pk in table_info.get("primary_keys", [])
+                if next(
+                    (col.get("null_percentage", 0) for col in columns if col.get("column_name") == pk),
+                    0
+                ) <= NULL_THRESHOLD_FOR_KEY  # ← null guard
+            ]
             surrogate_keys = table_info.get("surrogate_keys", [])
 
         avg_null_pct = (
@@ -589,9 +710,14 @@ def _run_er_modeling_and_save(
             if columns else 0
         )
 
-        has_normalized_counterpart = any(
-            _normalize_name(t.get("derived_from", "")) == _normalize_name(table_name)
-            for t in relationship_info.get("tables", [])
+        has_normalized_counterpart = (
+            relationship_info.get("model_source") == "ai"
+            and len(relationship_info.get("relationships", [])) > 0
+            and any(
+                _normalize_name(t.get("derived_from", "")) == _normalize_name(table_name)
+                for t in relationship_info.get("tables", [])
+                if t.get("is_normalized")
+            )
         )
         
         enriched_tables.append({
@@ -633,7 +759,7 @@ def _run_er_modeling_and_save(
     # Virtual fact table
     if fact_entity is not None:
         enriched_tables.append({
-            "table_name":     fact_entity.get("table", "fact_table").lower(),
+            "table_name":     "fact_table",
             "table_type":     "FACT",
             # ── Issue 5 fix: ensure derived_from is always a resolvable source table name
             "derived_from": (
@@ -649,7 +775,7 @@ def _run_er_modeling_and_save(
             "column_count": len(virtual_fact_columns),
             "null_percentage": 0.0,
             "primary_keys":   fact_entity.get("primary_keys", []) if fact_entity else [],
-            "surrogate_keys": fact_entity.get("surrogate_keys", []) if fact_entity else [],
+            "surrogate_keys": [],
             "foreign_keys":   virtual_fact_fks,
             "columns": [
                 {
@@ -668,7 +794,7 @@ def _run_er_modeling_and_save(
         })
     # Add normalized logical entities (AI-decomposed from source tables)
     # These are the real output when model_source == "ai" and decomposition happened
-    if model_source == "ai":
+    if model_source == "ai" and len(virtual_fact_fks) > 0:
         for norm_table in relationship_info.get("tables", []):
             entity_name  = norm_table.get("table", "").lower()
             derived_from = norm_table.get("derived_from", "")
@@ -676,16 +802,13 @@ def _run_er_modeling_and_save(
             # Skip physical source tables (already added above) and fact_table
             if not entity_name:
                 continue
-            if entity_name == "fact_table":
+            if entity_name == "fact_table" or entity_name == fact_entity_name:
                 continue
-            if fact_entity_name and entity_name == fact_entity_name:
-                continue
+            
 
             derived = norm_table.get("derived_from", "")
-            if not derived:
-                source_names = [s.get("table_name", "") for s in schemas]
-                if entity_name in source_names:
-                    continue
+            if not derived and entity_name in source_names:
+                continue
 
             enriched_tables.append({
                 "table_name":      entity_name,
@@ -721,7 +844,7 @@ def _run_er_modeling_and_save(
         if not to_table:  # skip malformed FKs
             continue
         enriched_relationships.append({
-            "from_table": fact_entity.get("table", "fact_table").lower() if fact_entity else "fact_table",
+            "from_table": "fact_table",
             "from_column":       fk.get("column", ""),
             "to_table":          fk.get("references_table", ""),
             "to_column":         fk.get("references_column", ""),
@@ -736,12 +859,24 @@ def _run_er_modeling_and_save(
             }
         })
 
-    # Also carry through any AI-detected entity-level relationships
-    fact_name = fact_entity.get("table", "").lower() if fact_entity else "fact_table"
+    # Carry through AI-detected entity-level relationships
+    # but only if both tables actually exist in enriched_tables
+    enriched_table_names = {t["table_name"].lower() for t in enriched_tables}
+    fact_name = fact_entity_name if fact_entity else None
+
     for rel in relationship_info.get("relationships", []):
         from_t = rel.get("from_table", "").lower()
-        if from_t != "fact_table" and from_t != fact_name:
-            enriched_relationships.append(rel)
+        to_t   = rel.get("to_table", "").lower()
+
+        if from_t != "fact_table" and (fact_name is None or from_t != fact_name):
+            if from_t in enriched_table_names and to_t in enriched_table_names:
+                enriched_relationships.append(rel)
+            else:
+                logging.warning(
+                    f"⚠️ Dropping relationship {from_t} → {to_t}: "
+                    f"one or both tables not in enriched_tables"
+                )
+    
     normalized_table_names = [
         t["table_name"] for t in enriched_tables
         if t.get("is_normalized") and t["table_name"] != "fact_table"
@@ -759,7 +894,7 @@ def _run_er_modeling_and_save(
         # Model metadata
         "model": {
             "type": "STAR_SCHEMA" if fact_entity else "ER_ONLY",
-            "fact_table": fact_entity.get("table", "fact_table").lower() if fact_entity else None,
+            "fact_table": "fact_table" if fact_entity else None,
             "dimension_tables": all_dim_tables
         },
 
@@ -784,12 +919,15 @@ def _run_er_modeling_and_save(
                 if fact_entity
                 else len(enriched_tables)
             ),
-            "fact_tables": [fact_entity.get("table", "fact_table").lower()] if fact_entity else [],
+            "fact_tables": ["fact_table"] if fact_entity else [],
             "dimension_tables":       all_dim_tables,
             "normalized_entities":    normalized_table_names,
             "physical_source_tables": physical_table_names,
             "total_relationships":    len(enriched_relationships),
-            "total_rows":             sum(t["row_count"] for t in enriched_tables)
+            "total_rows":             sum(
+                                            t["row_count"] for t in enriched_tables
+                                            if t.get("is_source_only")
+                                        )
         },
     }
 
@@ -812,11 +950,11 @@ def _run_er_modeling_and_save(
     for rel in enriched_relationships:
         rel["from_table"] = normalized_name_map.get(
             rel.get("from_table"),
-            rel.get("from_table", "").lower()
+            (rel.get("from_table") or "").lower()
         )
         rel["to_table"] = normalized_name_map.get(
             rel.get("to_table"),
-            rel.get("to_table", "").lower()
+            (rel.get("to_table") or "").lower()
         )
 
     # 2b️⃣ Normalize FK references_table inside each table's foreign_keys array
@@ -925,7 +1063,6 @@ def _run_er_modeling_and_save(
     # Only when AI modeling succeeded — fallback has no normalized entities
     # ============================================================
     if model_source == "ai":
-        normalized_entities = relationship_info.get("raw_entity_analysis", {})
         # Use normalized_entities from the tables list instead
         for table in relationship_info.get("tables", []):
             entity_name = table.get("table")
@@ -934,7 +1071,7 @@ def _run_er_modeling_and_save(
                 continue
 
             normalized_schema = {
-                "table_name":           entity_name,
+                "table_name":           entity_name_normalized,
                 "source":               "normalized",
                 "derived_from":         table.get("derived_from", ""),
                 "is_normalized":        True,

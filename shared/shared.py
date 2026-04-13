@@ -262,14 +262,32 @@ def detect_relationships(schemas, source_dfs=None):
         "7. For every relationship, assign a confidence score 0.0–1.0. "
         "OMIT any relationship where confidence < 0.7.\n"
         "8. Output ONLY valid JSON. No markdown. No explanation outside the JSON.\n\n"
-        "9. Name the fact entity 'fact_<grain>' (e.g. fact_appointment, fact_visit, "
-        "   fact_enrollment). Never use the generic name 'fact_table'.\n"
+        "9. Name the fact entity 'fact_table'.\n"
         "10. If an entity is nominated as the fact candidate, do NOT also create a separate "
         "    DIM entity derived from the same source with overlapping FK columns. "
         "    The fact entity IS that grain — it must not have a dimension twin.\n"
-        "11. If the fact entity contains date/datetime columns, extract a 'date_dimension' "
-        "    with attributes: Date, Year, Month, Day, Quarter, DayOfWeek. "
-        "    The fact entity keeps a DateKey FK referencing date_dimension.\n"
+        "11. If the fact entity contains date/datetime columns, extract a 'date_dimension'. "
+        "The date_dimension MUST use a surrogate key named 'DateKey' (integer, format YYYYMMDD). "
+        "The attributes must be: DateKey (PK surrogate), Date, Year, Month, Day, Quarter, DayOfWeek. "
+        "The fact entity must contain a DateKey foreign key referencing date_dimension.DateKey.\n"
+        "11b. If the fact entity contains string descriptive columns that are not FKs "
+        "     (e.g. product name, status, category), keep them on the fact table as "
+        "     degenerate dimensions. Do NOT drop them silently.\n"
+        "11c. When extracting numeric measures for the fact entity, exclude columns "
+        "     that are clearly identifiers or descriptive attributes such as phone "
+        "     numbers, zip codes, years used as labels, or any column whose name "
+        "     contains 'phone', 'zip', 'code', 'year' unless it is explicitly a "
+        "     measure like revenue or count.\n"
+        "12. If NO relationships exist between the provided tables, set "
+        "    'relationships' to [], 'standalone_entities' to the list of "
+        "    actual input table names only, and 'cardinality_diagram' to ''. "
+        "    Do NOT invent a fact_table entry.\n"
+        "12b. If no relationships exist, do NOT mention choosing a fact entity in observations. "
+        "     Only state that no relationships were found and list the standalone entities.\n"
+        "13. Every entity referenced in 'relationships' MUST also be defined in "
+        "    'normalized_entities'. Never reference an entity in a relationship "
+        "    that you have not fully defined. If you cannot define the entity, "
+        "    omit the relationship entirely.\n"
 
         "Steps:\n"
         "Step 1 — Analyse each table: identify if it is denormalized and what conceptual "
@@ -277,7 +295,7 @@ def detect_relationships(schemas, source_dfs=None):
         "Step 2 — Decompose denormalized tables into normalized entities with proper PKs/FKs.\n"
         "Step 2b — Choose ONE modeling approach and stick to it:\n"
         "  • The highest-grain entity (most FKs + numeric measures) becomes the fact entity.\n"
-        "  • Name it fact_<grain> (e.g. fact_appointment). Never 'fact_table'.\n"
+        "  • Name it fact_table.\n"
         "  • Do NOT also create a DIM entity for that same grain from the same source.\n"
         "  • All other embedded concepts become dimension entities.\n"
 "  • Do NOT create both a bridge/junction table AND a fact entity for the same grain.\n"
@@ -464,8 +482,6 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
             attr["is_surrogate"] = is_surrogate_deterministic
             
 
-            # Override whatever the AI said with our deterministic check
-            attr["is_surrogate"] = is_surrogate_deterministic
 
             # Add display metadata for frontend
             if is_surrogate_deterministic:
@@ -478,7 +494,7 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
                 surrogate_keys.append(attr_name)
             else:
                 # Find which source file this column came from
-                source_file = _find_source_file(attr_name_low, schemas)
+                source_file = _find_source_file(attr_name_low, schemas, preferred_table=entity_data.get("derived_from", ""))
                 attr["source"]        = source_file
                 attr["display_label"] = attr_name
                 attr["tooltip"]       = f"Source column from {source_file}"
@@ -506,9 +522,34 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
 
                 foreign_keys.append({
                     "column":            attr_name,
-                    "references_table":  ref_table.strip().lower(),
+                    "references_table":  _normalize_name(ref_table),
                     "references_column": ref_col.strip() if isinstance(ref_col, str) else ref_col
                 })
+        # ---------------------------------------------------------
+        # Fix Date Dimension Keys (force DateKey surrogate)
+        # ---------------------------------------------------------
+        if _normalize_name(entity_name) == "date_dimension":
+            attr_names = {a.get("name", "").lower() for a in attributes}
+
+            # If AI forgot DateKey, create it
+            if "datekey" not in attr_names:
+                attributes.insert(0, {
+                    "name": "DateKey",
+                    "data_type": "int",
+                    "is_foreign_key": False,
+                    "is_surrogate": True,
+                    "references": None,
+                    "source": "ai_generated",
+                    "display_label": "DateKey ✨",
+                    "tooltip": "Generated surrogate key for date dimension"
+                })
+
+                surrogate_keys.insert(0, "DateKey")
+                primary_key = ["DateKey"]
+
+                observations.append(
+                    "INFO: Added DateKey surrogate to date_dimension"
+                )
 
         # Only first surrogate should be PK — rest are regular attributes
         if len(surrogate_keys) > 1:
@@ -534,6 +575,46 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
             "foreign_keys":   foreign_keys,
             "attributes":     attributes
         })
+
+        # --- Degenerate dimension recovery (fact_table only) ---
+        if _normalize_name(entity_name) == "fact_table":
+            derived = entity_data.get("derived_from", "")
+            source_schema = next(
+                (s for s in schemas if s.get("table_name", "").lower() == derived.lower()),
+                None
+            )
+            if source_schema:
+                pk_names       = {_normalize_name(p) for p in entity_data.get("primary_key", [])}
+                fk_names       = {_normalize_name(f["column"]) for f in foreign_keys}
+                existing_names = {a.get("name", "").lower() for a in attributes}
+                already_tracked = existing_names | pk_names | fk_names
+
+            # Skip date columns if DateKey already exists as a FK
+            
+
+                for col in source_schema.get("columns", []):
+                    cname = col.get("column_name", "")
+                    if _normalize_name(cname) not in already_tracked:
+                        if "date" in cname.lower() and any(
+                            f["column"] == "DateKey" for f in foreign_keys
+                        ):
+                            continue
+                        attributes.append({
+                            "name":          cname,
+                            "data_type":     col.get("data_type", "string"),
+                            "is_foreign_key": False,
+                            "is_surrogate":  False,
+                            "references":    None,
+                            "source":        derived,
+                            "display_label": cname,
+                            "tooltip":       f"Source column from {derived}"
+                        })
+                        source_columns.append(cname)
+                        observations.append(
+                            f"INFO: Re-injected degenerate dimension '{cname}' "
+                            f"onto fact_table from source '{derived}'"
+                        )
+
     # ------------------------------------------------------------------
     # 4. Filter relationships by confidence
     # ------------------------------------------------------------------
@@ -561,14 +642,25 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
             continue
 
         relationships.append({
-            "from_table":        rel.get("from_entity", ""),
-            "from_column":       rel.get("from_column", ""),
-            "to_table":          rel.get("to_entity", ""),
-            "to_column":         rel.get("to_column", ""),
+            "from_table": _normalize_name(rel.get("from_entity", "")),
+            "from_column": rel.get("from_column", ""),
+            "to_table": _normalize_name(rel.get("to_entity", "")),
+            "to_column": rel.get("to_column", ""),
             "relationship_type": rel.get("type", ""),
             "description":       rel.get("description", ""),
             "confidence":        confidence
         })
+
+    # ---------------------------------------------------------
+    # Fix DateKey relationship mismatch
+    # ---------------------------------------------------------
+    for rel in relationships:
+        if _normalize_name(rel.get("to_table", "")) == "date_dimension":
+            if rel.get("to_column", "").lower() == "date":
+                rel["to_column"] = "DateKey"
+                observations.append(
+                    "INFO: Fixed relationship to date_dimension using DateKey"
+                )
 
     # ------------------------------------------------------------------
     # 5. Log summary
@@ -584,6 +676,25 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
         logging.info(f"   📝 {obs}")
     logging.info("=" * 60)
 
+    # Drop relationships that reference entities not in tables_info
+    defined_entities = {_normalize_name(t["table"]) for t in tables_info}
+    filtered_relationships = []
+    for rel in relationships:
+        from_e = _normalize_name(rel.get("from_table", ""))
+        to_e   = _normalize_name(rel.get("to_table", ""))
+        if from_e not in defined_entities or to_e not in defined_entities:
+            logging.warning(
+                f"⚠️ Dropping relationship {from_e} → {to_e}: "
+                f"entity not defined in normalized_entities"
+            )
+            observations.append(
+                f"DROPPED_REL: {from_e} → {to_e} | "
+                f"reason: entity not defined in normalized_entities"
+            )
+        else:
+            filtered_relationships.append(rel)
+    relationships = filtered_relationships
+
     return {
         "tables":              tables_info,
         "relationships":       relationships,
@@ -598,8 +709,18 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
     }
 
 
-def _find_source_file(col_name_lower: str, schemas: list) -> str:
-    """Return the table_name that contains this column, or 'unknown'."""
+def _find_source_file(col_name_lower: str, schemas: list, preferred_table: str = "") -> str:
+    """Return the table_name that contains this column, or 'unknown'.
+    Checks preferred_table (derived_from) first to avoid cross-table misattribution."""
+    # First pass: only look in the preferred source table
+    if preferred_table:
+        for schema in schemas:
+            if schema.get("table_name", "").lower() != preferred_table.lower():
+                continue
+            for col in schema.get("columns", []):
+                if col.get("column_name", "").strip().lower() == col_name_lower:
+                    return schema.get("table_name", "unknown")
+    # Second pass: fallback to any matching schema
     for schema in schemas:
         for col in schema.get("columns", []):
             if col.get("column_name", "").strip().lower() == col_name_lower:
@@ -649,6 +770,10 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
 
         for pk in entity.get("primary_keys", []):
             pk_norm = _normalize_name(pk)
+            surrogate_set = {_normalize_name(s) for s in entity.get("surrogate_keys", [])}
+            if pk_norm in surrogate_set:
+                validated_pks.append(pk)
+                continue
             col     = col_lookup.get(pk_norm)
             if not col:
                 observations.append(
@@ -703,6 +828,9 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
             validated_pks.append(pk)
 
         entity["primary_keys"] = validated_pks
+
+        if not validated_pks and not entity.get("surrogate_keys"):
+            invalid_pk_targets.add(key)
 
         if not validated_pks and entity.get("surrogate_keys"):
             # Promote first surrogate to PK
@@ -761,9 +889,7 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
                     to_is_numeric   = any(t in to_type for t in numeric)
                     to_is_string    = any(t in to_type for t in string)
 
-                    if from_is_string and to_is_numeric:
-                        reject_reason = f"type_mismatch ({from_type} vs {to_type})"
-                    elif from_is_numeric and to_is_string:
+                    if not _datatypes_compatible(from_type, to_type):
                         reject_reason = f"type_mismatch ({from_type} vs {to_type})"
 
                 # Check C: cardinality sanity
@@ -783,9 +909,12 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
 
             if child_df is not None and parent_df is not None:
                 try:
-                    if from_col in child_df.columns and to_col in parent_df.columns:
-                        child_vals  = child_df[from_col].dropna().unique()[:1000]
-                        parent_set  = set(parent_df[to_col].dropna().unique())
+                    child_cols = {c.lower(): c for c in child_df.columns}
+                    parent_cols = {c.lower(): c for c in parent_df.columns}
+
+                    if from_col.lower() in child_cols and to_col.lower() in parent_cols:
+                        child_vals = child_df[child_cols[from_col.lower()]].dropna().unique()[:1000]
+                        parent_set = set(parent_df[parent_cols[to_col.lower()]].dropna().unique())
                         if len(child_vals) > 0:
                             match_rate = sum(1 for v in child_vals if v in parent_set) / len(child_vals)
                             if match_rate < 0.95:
@@ -819,10 +948,22 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
         if source_schema:
             all_row_counts.append(source_schema.get("row_count", 0))
 
-    median_row_count = sorted(all_row_counts)[len(all_row_counts) // 2] if all_row_counts else 0
-    best_candidate     = None
-    best_row_count     = -1
-    best_measure_count = -1
+    if not all_row_counts:
+        median_row_count = 0
+    elif len(all_row_counts) == 1:
+        # Single table: set median to 0 so the row count gate always passes
+        median_row_count = 0
+    else:
+        sorted_counts = sorted(all_row_counts)
+        mid = len(sorted_counts) // 2
+        median_row_count = (
+            (sorted_counts[mid - 1] + sorted_counts[mid]) / 2
+            if len(sorted_counts) % 2 == 0
+            else sorted_counts[mid]
+        )
+
+    best_candidate = None
+    best_score = -1
     for entity in relationship_info.get("tables", []):
         display      = entity.get("table", "")
         display_obs = display.lower()
@@ -831,7 +972,11 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
         source_schema = schema_map.get(derived_norm) or schema_map.get(key)
  
         outgoing_fk_count = len(entity.get("foreign_keys", []))
-        row_count         = source_schema.get("row_count", 0) if source_schema else 0
+        source_schema = schema_map.get(derived_norm) or schema_map.get(key)
+        if not source_schema:
+            continue
+
+        row_count = source_schema.get("row_count", 0)
 
         if not source_schema:
             continue
@@ -852,19 +997,24 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
         )
 
         # Deterministic gate
-        if outgoing_fk_count < 2:
+        if outgoing_fk_count < 1:
             continue
         if measure_count < 1:
             continue
         if row_count < median_row_count:
             continue
 
+        row_count_weight = row_count / (median_row_count or 1)
         # ... inside loop, replace the winner block:
-        if measure_count > best_measure_count or \
-        (measure_count == best_measure_count and row_count > best_row_count):
-            best_row_count     = row_count
-            best_measure_count = measure_count
-            best_candidate     = key
+        score = (
+            outgoing_fk_count * 3 +
+            measure_count * 4 +
+            row_count_weight
+        )
+
+        if score > best_score:
+            best_score = score
+            best_candidate = key
 
     relationship_info["fact_entity_override"] = best_candidate
 
@@ -880,27 +1030,37 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
             fact_fk_set  = {_normalize_name(f["column"]) for f in fact_entity.get("foreign_keys", [])}
 
             ghost_keys = set()
-            for entity in relationship_info["tables"]:
-                if _normalize_name(entity.get("table", "")) == best_candidate:
-                    continue
-                if _normalize_name(entity.get("derived_from", "")) != fact_derived:
-                    continue
-                entity_fk_set = {_normalize_name(f["column"]) for f in entity.get("foreign_keys", [])}
-                if not fact_fk_set:
-                    continue
-                overlap = len(fact_fk_set & entity_fk_set) / len(fact_fk_set)
-                if overlap >= 0.7:
-                    ghost_keys.add(_normalize_name(entity.get("table", "")))
-                    observations.append(
-                        f"REMOVED_GHOST_DIM: {entity.get('table', '').lower()} | "
-                        f"reason: duplicate of fact grain '{best_candidate}' "
-                        f"({overlap:.0%} FK overlap, same derived_from)"
-                    )
 
-            relationship_info["tables"] = [
-                e for e in relationship_info["tables"]
-                if _normalize_name(e.get("table", "")) not in ghost_keys
-            ]
+            # Guard: if derived_from is empty, skip ghost removal entirely
+            # to avoid accidentally matching all entities with missing derived_from
+            if not fact_derived:
+                logging.warning(
+                    f"fact_entity '{best_candidate}' has no derived_from — "
+                    f"skipping ghost DIM removal to avoid false positives"
+                )
+            else:
+                for entity in relationship_info["tables"]:
+                    if _normalize_name(entity.get("table", "")) == best_candidate:
+                        continue
+                    entity_derived = _normalize_name(entity.get("derived_from", ""))
+                    if not entity_derived or entity_derived != fact_derived:
+                        continue
+                    entity_fk_set = {_normalize_name(f["column"]) for f in entity.get("foreign_keys", [])}
+                    if not fact_fk_set:
+                        continue
+                    overlap = len(fact_fk_set & entity_fk_set) / len(fact_fk_set)
+                    if overlap >= 0.7:
+                        ghost_keys.add(_normalize_name(entity.get("table", "")))
+                        observations.append(
+                            f"REMOVED_GHOST_DIM: {entity.get('table', '').lower()} | "
+                            f"reason: duplicate of fact grain '{best_candidate}' "
+                            f"({overlap:.0%} FK overlap, same derived_from)"
+                        )
+
+                relationship_info["tables"] = [
+                    e for e in relationship_info["tables"]
+                    if _normalize_name(e.get("table", "")) not in ghost_keys
+                ]
 
     if best_candidate is None:
         observations.append(
@@ -1161,24 +1321,23 @@ def _extract_json_from_text(text):
         pass
 
     # Find the largest JSON object in the text
-    matches = re.findall(r"\{.*\}", text, flags=re.DOTALL)
-    if not matches:
-        raise ValueError("No JSON object found in AI response")
+    start = text.find("{")
+    end   = text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object found")
+
+    candidate = text[start:end+1]
 
     try:
         return json.loads(candidate)
-    except json.JSONDecodeError:
-        logging.error("⚠️ AI returned malformed JSON. Truncating at last complete brace.")
-
-        # Try trimming from the end progressively
-        for i in range(len(candidate) - 1, 0, -1):
-            if candidate[i] == "}":
-                try:
-                    return json.loads(candidate[:i+1])
-                except:
-                    continue
-
-        raise
+    except json.JSONDecodeError as json_err:
+        logging.error(
+            f"❌ AI returned malformed JSON that could not be repaired: {json_err}. "
+            f"Triggering fallback instead of saving corrupt model."
+        )
+        raise ValueError(
+            f"AI JSON malformed and unrecoverable: {json_err}"
+        ) from json_err
 
 
 # ====================================================================
@@ -1186,11 +1345,16 @@ def _extract_json_from_text(text):
 # ====================================================================
 def _datatypes_compatible(d1, d2):
     """Basic datatype compatibility check."""
-    d1, d2 = d1.lower(), d2.lower()
-    if "int"     in d1 and "int"     in d2: return True
-    if "float"   in d1 and "float"   in d2: return True
-    if "decimal" in d1 and "decimal" in d2: return True
-    if "nvarchar" in d1 and "nvarchar" in d2: return True
+    numeric = {"int","bigint","long","float","double","decimal"}
+    string  = {"string","varchar","nvarchar","text","char"}
+
+    d1 = d1.lower()
+    d2 = d2.lower()
+
+    if any(t in d1 for t in numeric) and any(t in d2 for t in numeric):
+        return True
+    if any(t in d1 for t in string) and any(t in d2 for t in string):
+        return True
     return False
 
 
@@ -1204,15 +1368,23 @@ def extract_schema_from_json_file(data_bytes, file_name, file_path):
         data    = json.loads(content)
 
         if isinstance(data, dict):
+            # Find the largest array in the dict, not just the first one
+            best_key = None
+            best_len = 0
             for key, value in data.items():
-                if isinstance(value, list) and len(value) > 0:
-                    logging.info(f"📦 Found nested array '{key}' with {len(value)} records")
-                    df = pd.json_normalize(value, max_level=0)
-                    return extract_schema_metadata(df, key, file_path)
-            logging.info("📄 Found single JSON object")
-            df         = pd.json_normalize([data], max_level=0)
-            table_name = file_name.rsplit(".", 1)[0]
-            return extract_schema_metadata(df, table_name, file_path)
+                if isinstance(value, list) and len(value) > best_len:
+                    best_key = key
+                    best_len = len(value)
+
+            if best_key is not None:
+                logging.info(f"📦 Found largest nested array '{best_key}' with {best_len} records")
+                df = pd.json_normalize(data[best_key], max_level=0)
+                return extract_schema_metadata(df, best_key, file_path)
+            else:
+                logging.info("📄 Found single JSON object")
+                df         = pd.json_normalize([data], max_level=0)
+                table_name = file_name.rsplit(".", 1)[0]
+                return extract_schema_metadata(df, table_name, file_path)
 
         elif isinstance(data, list):
             logging.info(f"📦 Found JSON array with {len(data)} records")
@@ -1271,6 +1443,12 @@ def infer_simple_type(value):
     if isinstance(value, dict):  return "struct"
     return "string"
 
+def _sanitize_col_name(col):
+    clean = col.strip()
+    clean = re.sub(r'[ ,;{}()\n\t=]+', '_', clean)
+    clean = re.sub(r'_+', '_', clean)
+    return clean.strip('_')
+
 
 def extract_schema_metadata(df, table_name, file_path):
     """
@@ -1291,6 +1469,9 @@ def extract_schema_metadata(df, table_name, file_path):
         "extraction_timestamp": datetime.utcnow().isoformat(),
         "columns":              []
     }
+
+    # Rename DataFrame columns first
+    df = df.rename(columns={col: _sanitize_col_name(col) for col in df.columns})
 
     for column in df.columns:
         series = df[column]
